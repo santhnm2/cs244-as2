@@ -2,8 +2,10 @@ from __future__ import print_function
 
 from scapy.all import *
 import argparse
+import json
 import math
 import time
+import tqdm
 
 
 def send_syn(dst_ip, src_port, recv_window, mss, verbose=False):
@@ -25,7 +27,7 @@ def send_syn(dst_ip, src_port, recv_window, mss, verbose=False):
     if verbose:
         print(('Sending SYN packet to %s:%d. Advertising receive window size '
                '%d and MSS %d.') % (dst_ip, 80, recv_window, mss))
-    SYNACK=sr1(SYN)
+    SYNACK=sr1(SYN, verbose=verbose)
     if verbose:
         print('Received SYN-ACK:\n%s' % (SYNACK.show()))
 
@@ -47,12 +49,12 @@ def send_get_request(dst_ip, src_port, seq, ack, verbose=False):
           packets.
     """
     ip = IP(dst=dst_ip)
-    get = 'GET / HTTP/1.1\r\n'
+    get = 'GET / HTTP/1.1\r\nHost: %s\r\n\r\n' % (dst_ip)
     GET = ip/TCP(sport=src_port, dport=80, flags="A", seq=seq, ack=ack) / get
     if verbose:
         print('Sending GET request to %s:%d.' % (dst_ip, 80))
 
-    ans, unans = sr(GET)
+    ans, unans = sr(GET, verbose=verbose)
 
     if verbose:
         print('Received GET response:')
@@ -84,7 +86,7 @@ def sniff_packets(src_port, timeout, verbose=False):
     if verbose:
         print('Sniffing packets sent to port %d for %d seconds...' % (src_port,
                                                                       timeout))
-    packets = sniff(filter="dst port 50000", timeout=timeout)
+    packets = sniff(filter='dst port 50000', timeout=timeout)
 
     if verbose:
         print('Sniffed packets:')
@@ -94,62 +96,92 @@ def sniff_packets(src_port, timeout, verbose=False):
     return packets
 
 
-def send_fin(dst_ip, src_port, verbose=False):
+def send_fin(dst_ip, src_port, seq, ack, verbose=False):
     """Sends a FIN packet to DST_IP.
 
        Args:
           dst_ip: The destination IP address.
           src_port: The source port number.
           verbose: If True, print debug information.
-
-       Returns:
-          The response to the FIN packet.
     """
     ip = IP(dst=dst_ip)
-    FIN = ip/TCP(sport=src_port, dport=80, flags="FA")
+    FIN = ip/TCP(sport=src_port, dport=80, flags="FA", seq=seq, ack=ack)
     if verbose:
-        print('Sending FIN packet to %s:%d.')
-    FIN_response = sr1(FIN)
+        print('Sending FIN packet to %s:%d.' % (dst_ip, 80))
+    FIN_response = sr1(FIN, verbose=verbose)
     if verbose:
-        print('Received FIN response:\n%s' % (FIN_response.show()))
+        if FIN_response is None:
+            print('No FIN response.')
+        else:
+            print('Received FIN response:\n%s' % (FIN_response.show()))
 
-    return FIN_response
+    if verbose:
+        print('Acknowledging FIN from %s:%d.' % (dst_ip, 80))
+    if FIN_response is not None:
+        ACK = ip/TCP(sport=src_port, dport=80, flags="A", seq=FIN_response.ack,
+                     ack=FIN_response.seq+1)
+        sr1(ACK, verbose=verbose)
 
 
-def main(args):
-    if args.initial_delay is not None:
-        print('Waiting %d seconds before starting...' % (args.initial_delay))
-        time.sleep(args.initial_delay)
-    SYNACK = send_syn(args.dst_ip, args.src_port, args.recv_window, args.mss,
-                      args.verbose)
-    ans, unans = send_get_request(args.dst_ip, args.src_port, SYNACK.ack,
-                                  SYNACK.seq+1, args.verbose)
-    all_packets = sniff_packets(args.src_port, args.timeout, args.verbose)
-    FIN_response = send_fin(args.dst_ip, args.src_port, args.verbose)
+def measure_icw(dst_ip, src_port, recv_window, mss, timeout, verbose):
+    SYNACK = send_syn(dst_ip, src_port, recv_window, mss, verbose)
+    ans, unans = send_get_request(dst_ip, src_port, SYNACK.ack,
+                                  SYNACK.seq+1, verbose)
+    all_packets = sniff_packets(src_port, timeout, verbose)
     unique_packets = {}
     for i, packet in enumerate(all_packets):
         ip_datagram = packet.payload
         tcp_datagram = ip_datagram.payload
         data_len = ip_datagram.len - \
             (ip_datagram.ihl + tcp_datagram.dataofs) * 4
-        seq = tcp_datagram.seq
-        # print('Packet %d: seq=%d, len=%d' % (i, seq, data_len))
-        if seq in unique_packets:
-            unique_packets[seq] = max(data_len, unique_packets[seq])
-        else:
-            unique_packets[seq] = data_len
-    seqs = sorted([seq for seq in unique_packets])
-    for seq in seqs:
-        print('seq=%d, len=%d' % (seq, unique_packets[seq]))
-    icw_bytes = sum([unique_packets[seq] for seq in unique_packets])
-    icw_segments = int(math.ceil(icw_bytes / float(args.mss)))
-    print('ICW = %d bytes (%d segments)' % (icw_bytes, icw_segments))
+        payload = tcp_datagram.payload.show(dump=True)
+        unique_packets[payload] = data_len
 
+        """
+        if i == len(all_packets)-1:
+            send_fin(args.dst_ip, args.src_port, packet.ack, packet.seq+1,
+                     args.verbose)
+        """
+
+    icw_bytes = sum([unique_packets[payload] for payload in unique_packets])
+    icw_segments = int(math.ceil(icw_bytes / float(args.mss)))
+    return (icw_bytes, icw_segments)
+
+
+def main(args):
+    if args.initial_delay is not None:
+        print('Waiting %d seconds before starting...' % (args.initial_delay))
+        time.sleep(args.initial_delay)
+
+    if args.dst_ip is not None:
+        (icw_bytes, icw_segments) = measure_icw(args.dst_ip, args.src_port,
+                                                args.recv_window,
+                                                args.mss, args.timeout,
+                                                args.verbose)
+        print('%s ICW = %d bytes (%d segments)' % (args.dst_ip, icw_bytes,
+                                                   icw_segments))
+
+    elif args.input_file is not None:
+        results = {}
+        with open(args.input_file, 'r') as f:
+            lines = f.readlines()
+            for i, line in enumerate(lines):
+                dst_ip = line.strip()
+                (icw_bytes, icw_segments) = measure_icw(dst_ip, args.src_port,
+                                                        args.recv_window,
+                                                        args.mss, args.timeout,
+                                                        args.verbose)
+                results[dst_ip] = icw_segments
+                print(('[%d/%d] %s ICW = %d bytes '
+                       '(%d segments)') % (i+1, len(lines), dst_ip, icw_bytes,
+                                           icw_segments))
+
+        print(json.dumps(results, indent=4))
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(
       description='Estimate TCP initial window size')
-    parser.add_argument('--dst_ip', type=str, default='www.google.com',
+    parser.add_argument('--dst_ip', type=str, default=None,
                         help='Destination IP address')
     parser.add_argument('--src_port', type=int, default=50000,
                         help='Source port')
@@ -164,5 +196,13 @@ if __name__=='__main__':
     parser.add_argument('--initial_delay', type=int, default=None,
                         help=('Number of seconds to wait before establishing'
                               'connection'))
+    parser.add_argument('--input_file', type=str, default=None,
+                        help='File with list of IPs to measure')
     args = parser.parse_args()
+
+    if args.dst_ip is not None and args.input_file is not None:
+        raise ValueError('Only one of --dst_ip and --input_file may be set.')
+    elif args.dst_ip is None and args.input_file is None:
+        raise ValueError('One of --dst_ip and --input_file must be set.')
+
     main(args)
