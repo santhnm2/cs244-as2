@@ -27,9 +27,12 @@ def send_syn(dst_ip, src_port, recv_window, mss, verbose=False):
     if verbose:
         print(('Sending SYN packet to %s:%d. Advertising receive window size '
                '%d and MSS %d.') % (dst_ip, 80, recv_window, mss))
-    SYNACK=sr1(SYN, verbose=verbose)
+    SYNACK=sr1(SYN, verbose=verbose, timeout=10)
     if verbose:
-        print('Received SYN-ACK:\n%s' % (SYNACK.show()))
+        if SYNACK is not None:
+            print('Received SYN-ACK:\n%s' % (SYNACK.show(dump=True)))
+        else:
+            print('Could not establish a connection to %s.' % (dst_ip))
 
     return SYNACK
 
@@ -54,18 +57,18 @@ def send_get_request(dst_ip, src_port, seq, ack, verbose=False):
     if verbose:
         print('Sending GET request to %s:%d.' % (dst_ip, 80))
 
-    ans, unans = sr(GET, verbose=verbose)
+    ans, unans = sr(GET, verbose=verbose, timeout=5)
 
     if verbose:
         print('Received GET response:')
         if ans is not None:
           print('Answered packets:')
-          print(ans.show())
+          ans.show()
         else:
             print('No answered packets.')
         if unans is not None:
             print('Unanswered packets:')
-            print(unans.show())
+            unans.show()
         else:
             print('No unanswered packets.')
 
@@ -88,10 +91,12 @@ def sniff_packets(src_port, timeout, verbose=False):
                                                                       timeout))
     packets = sniff(filter='dst port 50000', timeout=timeout)
 
+    """
     if verbose:
         print('Sniffed packets:')
         for packet in packets:
-            print(packet.show())
+            packet.show())
+    """
 
     return packets
 
@@ -113,7 +118,7 @@ def send_fin(dst_ip, src_port, seq, ack, verbose=False):
         if FIN_response is None:
             print('No FIN response.')
         else:
-            print('Received FIN response:\n%s' % (FIN_response.show()))
+            print('Received FIN response:\n%s' % (FIN_response.show(dump=True)))
 
     if verbose:
         print('Acknowledging FIN from %s:%d.' % (dst_ip, 80))
@@ -125,23 +130,39 @@ def send_fin(dst_ip, src_port, seq, ack, verbose=False):
 
 def measure_icw(dst_ip, src_port, recv_window, mss, timeout, verbose):
     SYNACK = send_syn(dst_ip, src_port, recv_window, mss, verbose)
+    if SYNACK is None:
+        return (None, None)
     ans, unans = send_get_request(dst_ip, src_port, SYNACK.ack,
                                   SYNACK.seq+1, verbose)
+    if ans is None and unans is None:
+        return (None, None)
     all_packets = sniff_packets(src_port, timeout, verbose)
     unique_packets = {}
     for i, packet in enumerate(all_packets):
-        ip_datagram = packet.payload
-        tcp_datagram = ip_datagram.payload
-        data_len = ip_datagram.len - \
+        try:
+            ip_datagram = packet.payload
+            tcp_datagram = ip_datagram.payload
+            data_len = ip_datagram.len - \
             (ip_datagram.ihl + tcp_datagram.dataofs) * 4
-        payload = tcp_datagram.payload.show(dump=True)
-        unique_packets[payload] = data_len
-
+            payload = tcp_datagram.payload.show(dump=True)
+            unique_packets[payload] = data_len
+        except Exception as e:
+            continue
         """
         if i == len(all_packets)-1:
             send_fin(args.dst_ip, args.src_port, packet.ack, packet.seq+1,
                      args.verbose)
         """
+    received_http_ok = False
+    for payload in unique_packets:
+        if 'HTTP/1.1 200 OK' in payload:
+            received_http_ok = True
+            break
+    if not received_http_ok:
+        return (None, None)
+    elif verbose:
+        for payload in unique_packets:
+            print(payload)
 
     icw_bytes = sum([unique_packets[payload] for payload in unique_packets])
     icw_segments = int(math.ceil(icw_bytes / float(args.mss)))
@@ -149,6 +170,7 @@ def measure_icw(dst_ip, src_port, recv_window, mss, timeout, verbose):
 
 
 def main(args):
+
     if args.initial_delay is not None:
         print('Waiting %d seconds before starting...' % (args.initial_delay))
         time.sleep(args.initial_delay)
@@ -158,23 +180,34 @@ def main(args):
                                                 args.recv_window,
                                                 args.mss, args.timeout,
                                                 args.verbose)
+        if icw_bytes is None or icw_segments is None:
+            print('Could not get ICW for %s' % (args.dist_ip))
+            return
         print('%s ICW = %d bytes (%d segments)' % (args.dst_ip, icw_bytes,
                                                    icw_segments))
-
     elif args.input_file is not None:
         results = {}
         with open(args.input_file, 'r') as f:
             lines = f.readlines()
             for i, line in enumerate(lines):
                 dst_ip = line.strip()
-                (icw_bytes, icw_segments) = measure_icw(dst_ip, args.src_port,
-                                                        args.recv_window,
-                                                        args.mss, args.timeout,
-                                                        args.verbose)
-                results[dst_ip] = icw_segments
-                print(('[%d/%d] %s ICW = %d bytes '
-                       '(%d segments)') % (i+1, len(lines), dst_ip, icw_bytes,
-                                           icw_segments))
+                results[dst_ip] = []
+                for j in range(5):
+                    time.sleep(60)
+                    (icw_bytes, icw_segments) = measure_icw(dst_ip,
+                                                            args.src_port,
+                                                            args.recv_window,
+                                                            args.mss,
+                                                            args.timeout,
+                                                            args.verbose)
+                    if icw_bytes is None or icw_segments is None:
+                        results[dst_ip].append(None)
+                        continue
+                    results[dst_ip].append(icw_segments)
+                    print(('[%d/5 | %d/%d] %s ICW = %d bytes '
+                           '(%d segments)') % (j, i+1, len(lines), dst_ip,
+                                               icw_bytes,
+                                               icw_segments))
 
         print(json.dumps(results, indent=4))
 
