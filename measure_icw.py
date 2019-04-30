@@ -8,14 +8,15 @@ import time
 import tqdm
 
 
-def send_syn(dst_ip, src_port, recv_window, mss, verbose=False):
+def send_syn(dst_ip, src_port, recv_window, mss, timeout, verbose=False):
     """Sends a SYN packet and returns the SYN-ACK response.
 
        Args:
           dst_ip: The destination IP address.
           src_port: The source port number.
           recv_window: The receive window size to advertise in bytes.
-          mss: The MSS to advertise in bytes.
+          mss: The maximum segment size to advertise in bytes.
+          timeout: The send timeout in seconds.
           verbose: If True, print debug information.
 
         Returns:
@@ -27,7 +28,7 @@ def send_syn(dst_ip, src_port, recv_window, mss, verbose=False):
     if verbose:
         print(('Sending SYN packet to %s:%d. Advertising receive window size '
                '%d and MSS %d.') % (dst_ip, 80, recv_window, mss))
-    SYNACK=sr1(SYN, verbose=verbose, timeout=10)
+    SYNACK=sr1(SYN, verbose=verbose, timeout=timeout)
     if verbose:
         if SYNACK is not None:
             print('Received SYN-ACK:\n%s' % (SYNACK.show(dump=True)))
@@ -37,7 +38,7 @@ def send_syn(dst_ip, src_port, recv_window, mss, verbose=False):
     return SYNACK
 
 
-def send_get_request(dst_ip, src_port, seq, ack, verbose=False):
+def send_get_request(dst_ip, src_port, seq, ack, timeout, verbose=False):
     """Sends a GET request with a piggybacked ACK.
 
        Args:
@@ -45,6 +46,7 @@ def send_get_request(dst_ip, src_port, seq, ack, verbose=False):
           src_port: The source port number.
           seq: The sequence number.
           ack: The ack number.
+          timeout: The send timeout in seconds.
           verbose: If True, print debug information.
 
         Returns:
@@ -56,7 +58,7 @@ def send_get_request(dst_ip, src_port, seq, ack, verbose=False):
     if verbose:
         print('Sending GET request to %s:%d.' % (dst_ip, 80))
     send(GET, verbose=verbose)
-    packets = sniff(filter='dst port %d' % (src_port), timeout=10)
+    packets = sniff(filter='dst port %d' % (src_port), timeout=timeout)
     if verbose:
         print('Received %d packets' % (len(packets)))
     return packets
@@ -68,6 +70,8 @@ def send_fin(dst_ip, src_port, seq, ack, verbose=False):
        Args:
           dst_ip: The destination IP address.
           src_port: The source port number.
+          seq: The sequence number.
+          ack: The ack number.
           verbose: If True, print debug information.
     """
     ip = IP(dst=dst_ip)
@@ -87,7 +91,23 @@ def send_fin(dst_ip, src_port, seq, ack, verbose=False):
 
 
 def measure_icw(dst_ip, src_port, recv_window, mss, timeout, verbose):
-    SYNACK = send_syn(dst_ip, src_port, recv_window, mss, verbose)
+    """Measures the initial congestion window of the server located at DST_IP.
+
+       Args:
+          dst_ip: The destination IP address.
+          src_port: The source port number.
+          seq: The sequence number.
+          ack: The ack number.
+          recv_window: The receive window size to advertise in bytes.
+          mss: The maximum segment size to advertise in bytes.
+          verbose: If True, print debug information.
+
+       Returns:
+          A tuple of (initial window size in bytes,
+                      initial window size in segments).
+
+    """
+    SYNACK = send_syn(dst_ip, src_port, recv_window, mss, timeout, verbose)
     if SYNACK is None:
         return (None, None)
     packets = send_get_request(dst_ip, src_port, SYNACK.ack,
@@ -100,7 +120,8 @@ def measure_icw(dst_ip, src_port, recv_window, mss, timeout, verbose):
             data_len = ip_datagram.len - \
                 (ip_datagram.ihl + tcp_datagram.dataofs) * 4
             payload = tcp_datagram.payload.show(dump=True)
-            print('Packet %d: %s' % (i, payload))
+            if verbose:
+                print('Packet %d: %s' % (i, payload))
             if payload in unique_packets:
                 break
             else:
@@ -135,14 +156,10 @@ def main(args):
             lines = f.readlines()
             for i, line in enumerate(lines):
                 dst_ip = line.strip()
-                results[dst_ip] = []
-                """
-                if args.initial_delay is not None:
-                    print(('Waiting %d seconds before '
-                           'starting...') % (args.initial_delay))
-                    time.sleep(args.initial_delay)
-                """
-                for j in range(5):
+                results[dst_ip] = {}
+                results[dst_ip]['Bytes'] = []
+                results[dst_ip]['Segments'] = []
+                for j in range(args.num_trials):
                     (icw_bytes, icw_segments) = measure_icw(dst_ip,
                                                             args.src_port+j,
                                                             args.recv_window,
@@ -150,14 +167,16 @@ def main(args):
                                                             args.timeout,
                                                             args.verbose)
                     if icw_bytes is None or icw_segments is None:
-                        results[dst_ip].append(None)
+                        results[dst_ip]['Bytes'].append(None)
+                        results[dst_ip]['Segments'].append(None)
                         continue
-                    results[dst_ip].append(icw_segments)
+                    results[dst_ip]['Bytes'].append(icw_bytes)
+                    results[dst_ip]['Segments'].append(icw_segments)
                     print(('[%d/5 | %d/%d] %s ICW = %d bytes '
                            '(%d segments)') % (j+1, i+1, len(lines), dst_ip,
                                                icw_bytes,
                                                icw_segments))
-                    if j < 5:
+                    if j < args.num_trials - 1:
                         print('')
                         print('-' * 80)
                 print('')
@@ -185,6 +204,8 @@ if __name__=='__main__':
                               'connection'))
     parser.add_argument('--input_file', type=str, default=None,
                         help='File with list of IPs to measure')
+    parser.add_argument('--num_trials', type=int, default=5,
+                        help='The number of trials to run each experiment for.')
     args = parser.parse_args()
 
     if args.dst_ip is not None and args.input_file is not None:
