@@ -8,7 +8,7 @@ import time
 import tqdm
 
 
-def send_syn(dst_ip, src_port, recv_window, mss, timeout, verbose=False):
+def send_syn(dst_ip, src_port, recv_window, mss, timeout, verbose):
     """Sends a SYN packet and returns the SYN-ACK response.
 
        Args:
@@ -38,7 +38,7 @@ def send_syn(dst_ip, src_port, recv_window, mss, timeout, verbose=False):
     return SYNACK
 
 
-def send_get_request(dst_ip, src_port, seq, ack, timeout, verbose=False):
+def send_get_request(dst_ip, src_port, seq, ack, timeout, verbose):
     """Sends a GET request with a piggybacked ACK.
 
        Args:
@@ -64,7 +64,7 @@ def send_get_request(dst_ip, src_port, seq, ack, timeout, verbose=False):
     return packets
 
 
-def send_fin(dst_ip, src_port, seq, ack, verbose=False):
+def send_fin(dst_ip, src_port, seq, ack, verbose):
     """Sends a FIN packet to DST_IP.
 
        Args:
@@ -111,7 +111,7 @@ def measure_icw(dst_ip, src_port, recv_window, mss, timeout, verbose):
     if SYNACK is None:
         return (None, None)
     packets = send_get_request(dst_ip, src_port, SYNACK.ack,
-                               SYNACK.seq+1, verbose)
+                               SYNACK.seq+1, timeout, verbose)
     unique_packets = {}
     for i, packet in enumerate(packets):
         try:
@@ -179,10 +179,13 @@ def main(args):
                     if j < args.num_trials - 1:
                         print('')
                         print('-' * 80)
-                print('')
-                print('=' * 80)
+                    elif j == args.num_trials - 1:
+                        print('')
+                        print('=' * 80)
 
-        print(json.dumps(results, indent=4))
+        with open(args.logfile, 'r') as f:
+            f.write(json.dumps(results, indent=4))
+            print('Results written out to %s' % (args.logfile))
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(
@@ -206,6 +209,8 @@ if __name__=='__main__':
                         help='File with list of IPs to measure')
     parser.add_argument('--num_trials', type=int, default=5,
                         help='The number of trials to run each experiment for.')
+    parser.add_argument('--logfile', type=str, required=True,
+                        help='The file to write results to')
     args = parser.parse_args()
 
     if args.dst_ip is not None and args.input_file is not None:
