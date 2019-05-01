@@ -5,7 +5,6 @@ import argparse
 import json
 import math
 import time
-import tqdm
 
 
 def send_syn(dst_ip, src_port, recv_window, mss, timeout, verbose):
